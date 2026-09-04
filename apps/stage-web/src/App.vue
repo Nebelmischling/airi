@@ -1,15 +1,25 @@
 <script setup lang="ts">
-import { OnboardingDialog, ToasterRoot } from '@proj-airi/stage-ui/components'
-import { useSharedAnalyticsStore } from '@proj-airi/stage-ui/stores/analytics'
+import { OnboardingDialog, OnboardingStepAnalyticsNotice, ToasterRoot } from '@proj-airi/stage-ui/components'
+import { useInferencePreload } from '@proj-airi/stage-ui/composables'
+import { usePiniaSynced } from '@proj-airi/stage-ui/libs/pinia'
+import { initializeAnalytics, isAnalyticsAvailableInBuild } from '@proj-airi/stage-ui/libs/product-signals'
+import { useAuthStore } from '@proj-airi/stage-ui/stores/auth'
 import { useCharacterOrchestratorStore } from '@proj-airi/stage-ui/stores/character'
-import { useChatSessionStore } from '@proj-airi/stage-ui/stores/chat/session-store'
+import { useChatStore } from '@proj-airi/stage-ui/stores/chat'
 import { useDisplayModelsStore } from '@proj-airi/stage-ui/stores/display-models'
 import { useModsServerChannelStore } from '@proj-airi/stage-ui/stores/mods/api/channel-server'
 import { useContextBridgeStore } from '@proj-airi/stage-ui/stores/mods/api/context-bridge'
 import { useAiriCardStore } from '@proj-airi/stage-ui/stores/modules/airi-card'
+import { useArtistryStore } from '@proj-airi/stage-ui/stores/modules/artistry'
+import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consciousness'
+import { configureAsDefaultsIfEmpty, unconfigureAuthenticationProviders } from '@proj-airi/stage-ui/stores/modules/default'
+import { useHearingStore } from '@proj-airi/stage-ui/stores/modules/hearing'
+import { useSpeechStore } from '@proj-airi/stage-ui/stores/modules/speech'
+import { useVisionStore } from '@proj-airi/stage-ui/stores/modules/vision'
 import { useOnboardingStore } from '@proj-airi/stage-ui/stores/onboarding'
-import { useSettings } from '@proj-airi/stage-ui/stores/settings'
-import { useTheme } from '@proj-airi/ui'
+import { useSettings, useSettingsAudioDevice } from '@proj-airi/stage-ui/stores/settings'
+import { useSettingsStageModel } from '@proj-airi/stage-ui/stores/settings/stage-model'
+import { ErrorBoundary, useTheme } from '@proj-airi/ui'
 import { StageTransitionGroup } from '@proj-airi/ui-transitions'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, onUnmounted, watch } from 'vue'
@@ -24,18 +34,51 @@ import { usePWAStore } from './stores/pwa'
 usePWAStore()
 
 const contextBridgeStore = useContextBridgeStore()
+const authStore = useAuthStore()
 const i18n = useI18n()
 const displayModelsStore = useDisplayModelsStore()
 const settingsStore = useSettings()
 const settings = storeToRefs(settingsStore)
 const onboardingStore = useOnboardingStore()
-const chatSessionStore = useChatSessionStore()
+const chatStore = useChatStore()
+const syncedPinia = usePiniaSynced()
 const serverChannelStore = useModsServerChannelStore()
 const characterOrchestratorStore = useCharacterOrchestratorStore()
-const { shouldShowSetup } = storeToRefs(onboardingStore)
+const settingsAudioDeviceStore = useSettingsAudioDevice()
+const { showingSetup } = storeToRefs(onboardingStore)
 const { isDark } = useTheme()
 const cardStore = useAiriCardStore()
-const analyticsStore = useSharedAnalyticsStore()
+useArtistryStore()
+useConsciousnessStore()
+useHearingStore()
+useSpeechStore()
+useSettingsStageModel()
+useVisionStore()
+
+let stopAuthenticatedSetup: (() => void) | undefined
+let stopLoggedOutSetup: (() => void) | undefined
+
+async function removeAuthenticationProviderConfiguration() {
+  if (!syncedPinia.isLeader())
+    return
+
+  if (await unconfigureAuthenticationProviders())
+    await cardStore.persistActiveCardModuleSelections()
+}
+
+function registerAuthenticatedSetup() {
+  stopAuthenticatedSetup ??= authStore.onAuthenticated(async () => {
+    if (!syncedPinia.isLeader())
+      return
+
+    if (await configureAsDefaultsIfEmpty())
+      await cardStore.persistActiveCardModuleSelections()
+    await onboardingStore.closeAfterAuthentication()
+  })
+  stopLoggedOutSetup ??= authStore.onLogout(removeAuthenticationProviderConfiguration)
+}
+
+const inferencePreload = useInferencePreload()
 
 const primaryColor = computed(() => {
   return isDark.value
@@ -59,6 +102,12 @@ const colors = computed(() => {
   return [primaryColor.value, secondaryColor.value, tertiaryColor.value, isDark.value ? '#121212' : '#FFFFFF']
 })
 
+const onboardingExtraSteps = computed(() => {
+  return isAnalyticsAvailableInBuild()
+    ? [{ id: 'analytics-notice', component: OnboardingStepAnalyticsNotice }]
+    : []
+})
+
 watch(settings.language, () => {
   i18n.locale.value = settings.language.value
 })
@@ -73,21 +122,35 @@ watch(settings.themeColorsHueDynamic, () => {
 
 // Initialize first-time setup check when app mounts
 onMounted(async () => {
-  analyticsStore.initialize()
-  cardStore.initialize()
+  initializeAnalytics()
+  await authStore.initialize()
+  await displayModelsStore.initialize()
+  await cardStore.initialize()
+  registerAuthenticatedSetup()
+  if (!authStore.isAuthenticated)
+    await removeAuthenticationProviderConfiguration()
 
-  onboardingStore.initializeSetupCheck()
+  if (onboardingStore.needsOnboarding) {
+    onboardingStore.showingSetup = true
+  }
 
-  await chatSessionStore.initialize()
+  await chatStore.initialize(syncedPinia)
   await serverChannelStore.initialize({ possibleEvents: ['ui:configure'] }).catch(err => console.error('Failed to initialize Mods Server Channel in App.vue:', err))
-  await contextBridgeStore.initialize()
+  contextBridgeStore.initialize()
   characterOrchestratorStore.initialize()
 
   await displayModelsStore.loadDisplayModelsFromIndexedDB()
   await settingsStore.initializeStageModel()
+  await settingsAudioDeviceStore.initialize()
+
+  // Preload local inference models (Kokoro TTS, etc.) in background after a delay
+  inferencePreload.triggerPreload()
 })
 
 onUnmounted(() => {
+  stopAuthenticatedSetup?.()
+  stopLoggedOutSetup?.()
+  chatStore.dispose()
   contextBridgeStore.dispose()
 })
 
@@ -112,9 +175,12 @@ function handleSetupSkipped() {
     :use-page-specific-transitions="settings.usePageSpecificTransitions.value"
   >
     <RouterView v-slot="{ Component }">
-      <KeepAlive :include="['IndexScenePage', 'StageScenePage']">
+      <ErrorBoundary
+        title="Something went wrong while rendering this page."
+        @error="(err, _, info) => console.error('[ErrorBoundary]', info, err)"
+      >
         <component :is="Component" />
-      </KeepAlive>
+      </ErrorBoundary>
     </RouterView>
   </StageTransitionGroup>
 
@@ -124,7 +190,8 @@ function handleSetupSkipped() {
 
   <!-- First Time Setup Dialog -->
   <OnboardingDialog
-    v-model="shouldShowSetup"
+    v-model="showingSetup"
+    :extra-steps="onboardingExtraSteps"
     @configured="handleSetupConfigured"
     @skipped="handleSetupSkipped"
   />

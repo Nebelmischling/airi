@@ -1,16 +1,25 @@
 <script setup lang="ts">
 import { Alert, ErrorContainer, RadioCardManySelect, RadioCardSimple } from '@proj-airi/stage-ui/components'
 import { useAnalytics } from '@proj-airi/stage-ui/composables'
+import { useAiriCardStore } from '@proj-airi/stage-ui/stores/modules/airi-card'
 import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consciousness'
-import { useProvidersStore } from '@proj-airi/stage-ui/stores/providers'
+import { useConsciousnessSettingsStore } from '@proj-airi/stage-ui/stores/modules/consciousness-settings'
+import { useProviderConfigStore } from '@proj-airi/stage-ui/stores/providers/config'
+import { useProviderStore } from '@proj-airi/stage-ui/stores/providers/provider'
+import { FieldCheckbox } from '@proj-airi/ui'
 import { storeToRefs } from 'pinia'
 import { watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { RouterLink } from 'vue-router'
 
-const providersStore = useProvidersStore()
+const providersStore = useProviderStore()
+const providerStore = useProviderConfigStore()
+const airiCardStore = useAiriCardStore()
 const consciousnessStore = useConsciousnessStore()
-const { persistedChatProvidersMetadata, configuredProviders } = storeToRefs(providersStore)
+const consciousnessSettingsStore = useConsciousnessSettingsStore()
+const { configuredProviders } = storeToRefs(providerStore)
+const { moduleChatProvidersMetadata } = storeToRefs(providersStore)
+const { reasoning } = storeToRefs(consciousnessSettingsStore)
 const {
   activeProvider,
   activeModel,
@@ -23,22 +32,28 @@ const {
 } = storeToRefs(consciousnessStore)
 
 const { t } = useI18n()
-const { trackProviderClick } = useAnalytics()
-
-watch(activeProvider, async (provider, oldProvider) => {
+const { trackModelSwitched, trackProviderClick } = useAnalytics()
+watch(activeProvider, async (provider) => {
   if (!provider)
     return
-
-  // Reset model when switching providers (but not on initial load)
-  if (oldProvider !== undefined && oldProvider !== provider) {
-    activeModel.value = ''
-  }
 
   await consciousnessStore.loadModelsForProvider(provider)
 }, { immediate: true })
 
+watch([activeProvider, activeModel], ([provider, model]) => {
+  void airiCardStore.updateActiveCardConsciousness({ provider, model })
+})
+
 function updateCustomModelName(value: string) {
   customModelName.value = value
+}
+
+function selectModel(modelId: string) {
+  const previousModelId = activeModel.value
+  activeModel.value = modelId
+
+  if (previousModelId !== modelId)
+    trackModelSwitched(previousModelId || 'none', modelId)
 }
 
 function handleDeleteProvider(providerId: string) {
@@ -47,6 +62,10 @@ function handleDeleteProvider(providerId: string) {
     activeModel.value = ''
   }
   providersStore.deleteProvider(providerId)
+}
+
+async function updateReasoning(value: boolean) {
+  await consciousnessSettingsStore.setReasoning(value)
 }
 </script>
 
@@ -69,14 +88,13 @@ function handleDeleteProvider(providerId: string) {
           See also: https://stackoverflow.com/a/33737340
         -->
           <fieldset
-            v-if="persistedChatProvidersMetadata.length > 0"
+            v-if="moduleChatProvidersMetadata.length > 0"
             flex="~ row gap-4"
-            :style="{ 'scrollbar-width': 'none' }"
-            min-w-0 of-x-scroll scroll-smooth
+            min-w-0 overflow-x-auto scroll-smooth
             role="radiogroup"
           >
             <RadioCardSimple
-              v-for="metadata in persistedChatProvidersMetadata"
+              v-for="metadata in moduleChatProvidersMetadata"
               :id="metadata.id"
               :key="metadata.id"
               v-model="activeProvider"
@@ -86,7 +104,7 @@ function handleDeleteProvider(providerId: string) {
               :description="metadata.localizedDescription"
               @click="trackProviderClick(metadata.id, 'consciousness')"
             >
-              <template #topRight>
+              <template v-if="!metadata.id.startsWith('official-provider')" #topRight>
                 <button
                   type="button"
                   class="rounded bg-neutral-100 p-1 text-neutral-600 transition-colors dark:bg-neutral-800/60 hover:bg-neutral-200 dark:text-neutral-300 dark:hover:bg-neutral-700/60"
@@ -145,8 +163,9 @@ function handleDeleteProvider(providerId: string) {
           <h2 class="text-lg md:text-2xl">
             {{ t('settings.pages.modules.consciousness.sections.section.provider-model-selection.title') }}
           </h2>
-          <div text="neutral-400 dark:neutral-400">
+          <div class="flex flex-col items-start gap-1 text-neutral-400 md:flex-row md:items-center md:justify-between dark:text-neutral-400">
             <span>{{ t('settings.pages.modules.consciousness.sections.section.provider-model-selection.subtitle') }}</span>
+            <span v-if="activeModel" class="text-sm text-neutral-400 font-medium dark:text-neutral-400">{{ t('settings.pages.modules.consciousness.sections.section.provider-model-selection.current_model_label') }} {{ activeModel }}</span>
           </div>
         </div>
 
@@ -159,43 +178,41 @@ function handleDeleteProvider(providerId: string) {
         </div>
 
         <!-- Error state -->
-        <ErrorContainer
-          v-else-if="activeProviderModelError"
-          :title="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.error')"
-          :error="activeProviderModelError"
-        />
+        <template v-else-if="activeProviderModelError">
+          <ErrorContainer
+            :title="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.error')"
+            :error="activeProviderModelError"
+          />
+          <!-- Manual model input fallback when model list fails to load -->
+          <div class="mt-2">
+            <label class="mb-1 block text-sm font-medium">
+              {{ t('settings.pages.modules.consciousness.sections.section.provider-model-selection.manual_model_name') }}
+            </label>
+            <input
+              v-model="activeModel" type="text"
+              class="w-full border border-neutral-300 rounded bg-white px-3 py-2 dark:border-neutral-700 dark:bg-neutral-900"
+              :placeholder="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.manual_model_placeholder')"
+            >
+          </div>
+        </template>
 
-        <!-- Manual model input fallback when model list fails to load -->
-        <div v-if="activeProviderModelError" class="mt-2">
-          <label class="mb-1 block text-sm font-medium">
-            {{ t('settings.pages.modules.consciousness.sections.section.provider-model-selection.manual_model_name') }}
-          </label>
-          <input
-            v-model="activeModel" type="text"
-            class="w-full border border-neutral-300 rounded bg-white px-3 py-2 dark:border-neutral-700 dark:bg-neutral-900"
-            :placeholder="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.manual_model_placeholder')"
-          >
-        </div>
+        <!-- No models available - Allow custom model input via search -->
+        <!-- Only show when there are truly no models (not when fetch error occurred) to avoid competing UIs -->
+        <template v-else-if="providerModels.length === 0 && !isLoadingActiveProviderModels && !activeProviderModelError">
+          <Alert type="warning">
+            <template #title>
+              {{ t('settings.pages.modules.consciousness.sections.section.provider-model-selection.no_models') }}
+            </template>
+            <template #content>
+              {{ t('settings.pages.modules.consciousness.sections.section.provider-model-selection.no_models_description') }}
+            </template>
+          </Alert>
 
-        <!-- No models available -->
-        <Alert
-          v-else-if="providerModels.length === 0 && !isLoadingActiveProviderModels"
-          type="warning"
-        >
-          <template #title>
-            {{ t('settings.pages.modules.consciousness.sections.section.provider-model-selection.no_models') }}
-          </template>
-          <template #content>
-            {{ t('settings.pages.modules.consciousness.sections.section.provider-model-selection.no_models_description') }}
-          </template>
-        </Alert>
-
-        <!-- Using the new RadioCardManySelect component -->
-        <template v-else-if="providerModels.length > 0">
+          <!-- Using the new RadioCardManySelect component - works with empty list for custom input -->
           <RadioCardManySelect
-            v-model="activeModel"
             v-model:search-query="modelSearchQuery"
-            :items="providerModels.sort((a, b) => a.id === activeModel ? -1 : b.id === activeModel ? 1 : 0)"
+            :model-value="activeModel"
+            :items="[]"
             :searchable="true"
             :allow-custom="true"
             :search-placeholder="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.search_placeholder')"
@@ -205,6 +222,28 @@ function handleDeleteProvider(providerId: string) {
             :custom-input-placeholder="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.custom_model_placeholder')"
             :expand-button-text="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.expand')"
             :collapse-button-text="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.collapse')"
+            @update:model-value="selectModel"
+            @update:custom-value="updateCustomModelName"
+          />
+        </template>
+
+        <!-- Using the new RadioCardManySelect component -->
+        <template v-else-if="providerModels.length > 0">
+          <RadioCardManySelect
+            v-model:search-query="modelSearchQuery"
+            :model-value="activeModel"
+            :items="providerModels"
+            :searchable="true"
+            :allow-custom="true"
+            :search-placeholder="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.search_placeholder')"
+            :search-no-results-title="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.no_search_results')"
+            :search-no-results-description="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.no_search_results_description', { query: modelSearchQuery })"
+            :search-results-text="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.search_results', { count: '{count}', total: '{total}' })"
+            :custom-input-placeholder="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.custom_model_placeholder')"
+            :expand-button-text="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.expand')"
+            :collapse-button-text="t('settings.pages.modules.consciousness.sections.section.provider-model-selection.collapse')"
+            expanded-class="mb-12"
+            @update:model-value="selectModel"
             @update:custom-value="updateCustomModelName"
           />
         </template>
@@ -248,6 +287,21 @@ function handleDeleteProvider(providerId: string) {
         </div>
       </div>
     </div>
+
+    <section
+      v-if="activeProvider && activeModel"
+      :class="['flex', 'flex-col', 'gap-4', 'border-t', 'border-neutral-200', 'pt-4', 'dark:border-neutral-800']"
+    >
+      <h2 :class="['text-lg', 'text-neutral-500', 'md:text-2xl', 'dark:text-neutral-400']">
+        {{ t('settings.pages.modules.consciousness.sections.section.model-options.title') }}
+      </h2>
+
+      <FieldCheckbox
+        :model-value="reasoning"
+        :label="t('settings.pages.modules.consciousness.sections.section.model-options.thinking.label')"
+        @update:model-value="updateReasoning"
+      />
+    </section>
   </div>
 
   <div
